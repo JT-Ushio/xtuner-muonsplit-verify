@@ -270,6 +270,20 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
         if freeze_dsa_indexer:
             self.indexer.requires_grad_(False)
 
+    def get_muon_split_sizes(self) -> dict[nn.Parameter, tuple[int, ...]]:
+        """Return MuonSplit row blocks for the NoPE projection layout.
+
+        Returns:
+            dict[nn.Parameter, tuple[int, ...]]: Per-head query blocks, the single compressed-KV block, and
+            interleaved per-head key/value blocks. NoPE has no rotary rows to split out.
+        """
+        return {
+            cast(nn.Parameter, self.q_b_proj.weight): (self.qk_nope_head_dim,) * self.num_attention_heads,
+            cast(nn.Parameter, self.kv_a_proj_with_mqa.weight): (self.kv_lora_rank,),
+            cast(nn.Parameter, self.kv_b_proj.weight): (self.qk_nope_head_dim, self.v_head_dim)
+            * self.num_attention_heads,
+        }
+
     def forward(
         self,
         hidden_states: torch.Tensor,

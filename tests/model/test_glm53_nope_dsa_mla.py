@@ -5,15 +5,31 @@ TestNoPEDSAMultiLatentAttentionMatchesHF
     test_document1_output_unaffected_by_document0_content  packed 下文档之间互不影响
 TestNoPEDSAMultiLatentAttentionFloat8
     test_kv_b_proj_stays_high_precision_under_fp8          absorbed 折叠所需的投影不量化
+TestNoPEDSAMuonSplit
+    test_blocks_follow_absorbed_projection_layout          NoPE 分块与实际 Q/K/V 行布局一致
+TestNoPEDSAMuonSplitFSDP
+    test_muon_config_updates_independent_blocks_after_fsdp FSDP 后真实 Muon 按独立块更新，KDA 不套用 DSA 分块
 TestNoPEDSAMLAConfigIndexerChunking
     test_config_reaches_the_indexer                        分块配置真正传到 indexer
     test_defaults_to_a_single_launch                       默认单次 launch，不改既有行为
 """
 
-import torch
+import math
 
+import pytest
+import torch
+import torch.distributed as dist
+from torch.distributed.tensor import DTensor, distribute_tensor
+
+from xtuner._testing import DeterministicDDPTestCase
+from xtuner.v1.config import FSDPConfig
+from xtuner.v1.config.optim import MuonConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model.moe.glm53 import NoPEDSAMLAConfig
+from xtuner.v1.model.moe.glm53.glm53 import Glm53TextMoEConfig
+from xtuner.v1.model.moe.glm53.nope_dsa_mla import NoPEDSAMultiLatentAttention
+from xtuner.v1.module.attention.kda import KDAConfig
+from xtuner.v1.optim.muon import zeropower_via_newtonschulz5
 
 
 HIDDEN = 32
@@ -28,13 +44,13 @@ INDEX_KPOOL = 2
 INDEX_TOPK = 4
 
 
-def _xtuner_module():
+def _xtuner_module(v_head_dim: int = V_HEAD_DIM) -> NoPEDSAMultiLatentAttention:
     cfg = NoPEDSAMLAConfig(
         q_lora_rank=Q_LORA_RANK,
         kv_lora_rank=KV_LORA_RANK,
         qk_nope_head_dim=QK_NOPE_HEAD_DIM,
         qk_rope_head_dim=0,
-        v_head_dim=V_HEAD_DIM,
+        v_head_dim=v_head_dim,
         num_attention_heads=NUM_HEADS,
         head_dim=0,
         index_topk=INDEX_TOPK,
@@ -159,6 +175,129 @@ class TestNoPEDSAMultiLatentAttentionMatchesHF:
             ]
 
         torch.testing.assert_close(out_a[:, len0:], out_b[:, len0:], atol=1e-6, rtol=1e-6)
+
+
+class TestNoPEDSAMuonSplit:
+    """NoPE 的逻辑分块必须对应吸收式 MLA 真正使用的权重行。"""
+
+    def test_blocks_follow_absorbed_projection_layout(self) -> None:
+        """使用不同的 K/V 宽度，捕获顺序颠倒、跨 head 分块和零长 RoPE 块。"""
+        module = _xtuner_module(v_head_dim=12)
+        splits = module.get_muon_split_sizes()
+        assert set(splits) == {
+            module.q_b_proj.weight,
+            module.kv_a_proj_with_mqa.weight,
+            module.kv_b_proj.weight,
+        }
+        for weight, sizes in splits.items():
+            assert all(size > 0 for size in sizes)
+            assert sum(sizes) == weight.shape[0]
+
+        # 行号填充可明确区分不同 head 的 K/V，而不依赖随机初始化。
+        with torch.no_grad():
+            for weight in splits:
+                weight.copy_(torch.arange(weight.numel()).view_as(weight))
+
+        query_heads = module.q_b_proj.weight.view(NUM_HEADS, QK_NOPE_HEAD_DIM, Q_LORA_RANK)
+        for block, head in zip(module.q_b_proj.weight.split(splits[module.q_b_proj.weight]), query_heads):
+            torch.testing.assert_close(block, head)
+        assert splits[module.q_b_proj.weight] == (QK_NOPE_HEAD_DIM,) * NUM_HEADS
+        assert splits[module.kv_a_proj_with_mqa.weight] == (KV_LORA_RANK,)
+
+        key_heads, value_heads = module._absorb_weights()
+        kv_blocks = module.kv_b_proj.weight.split(splits[module.kv_b_proj.weight])
+        assert len(kv_blocks) == 2 * NUM_HEADS
+        for head in range(NUM_HEADS):
+            torch.testing.assert_close(kv_blocks[2 * head], key_heads[head])
+            torch.testing.assert_close(kv_blocks[2 * head + 1], value_heads[head])
+
+
+@pytest.mark.gpu
+class TestNoPEDSAMuonSplitFSDP(DeterministicDDPTestCase):
+    """真实模型经 FSDP 替换参数后，MuonConfig 仍收集到正确的对象与分块。"""
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    def test_muon_config_updates_independent_blocks_after_fsdp(self) -> None:
+        """验证实际优化器的一步更新，参考值逐 head 的 K/V 独立正交化。"""
+        # 通过真实 FSDP 和 MuonConfig 验证分块更新，并确认 KDA 投影保持独立。
+        self.create_pg("cuda")
+        cfg = Glm53TextMoEConfig(
+            compile_cfg=False,
+            vocab_size=64,
+            pad_token_id=0,
+            eos_token_id=1,
+            hf_eos_token_id=[1],
+            num_hidden_layers=2,
+            first_k_dense_replace=2,
+            hidden_size=HIDDEN,
+            intermediate_size=64,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            attention=NoPEDSAMLAConfig(
+                q_lora_rank=Q_LORA_RANK,
+                kv_lora_rank=KV_LORA_RANK,
+                qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+                qk_rope_head_dim=0,
+                v_head_dim=12,
+                num_attention_heads=NUM_HEADS,
+                head_dim=0,
+                index_topk=INDEX_TOPK,
+                index_head_dim=INDEX_HEAD_DIM,
+                index_n_heads=INDEX_N_HEADS,
+                index_kpool=INDEX_KPOOL,
+                sparse_mla_backend="torch",
+                indexer_backend="torch",
+            ),
+            linear_attention=KDAConfig(num_heads=2, head_dim=16),
+            glm53_layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mtp_config=None,
+            ep_size=1,
+        )
+        model = cfg.build().to("cuda")
+        model.init_weights()
+        model.fully_shard(
+            FSDPConfig(ep_size=1, param_dtype=torch.float32, reduce_dtype=torch.float32, torch_compile=False)
+        )
+        attention = model.layers["1"].self_attn
+        lr = 0.01
+        optimizer = MuonConfig(lr=lr, momentum=0.0, weight_decay=0.0, eps=1e-7).build(model)
+        splits = optimizer._muon_split_sizes
+        assert set(splits) == {
+            attention.q_b_proj.weight,
+            attention.kv_a_proj_with_mqa.weight,
+            attention.kv_b_proj.weight,
+        }
+        # KDA 的 Q/K/V 本来就是三个独立投影，不应被 NoPE DSA 的布局规则覆盖。
+        kda = model.layers["0"].self_attn
+        for projection in (kda.q_proj, kda.k_proj, kda.v_proj):
+            assert projection.weight not in splits
+
+        expected = {}
+        for weight, block_sizes in (
+            (attention.q_b_proj.weight, (QK_NOPE_HEAD_DIM,) * NUM_HEADS),
+            (attention.kv_a_proj_with_mqa.weight, (KV_LORA_RANK,)),
+            (attention.kv_b_proj.weight, (QK_NOPE_HEAD_DIM, 12) * NUM_HEADS),
+        ):
+            assert isinstance(weight, DTensor)
+            assert splits[weight] == block_sizes
+            assert optimizer.state[weight]["lr_ratio"] == 1.0
+            full_weight = weight.full_tensor().detach()
+            gradient = torch.randn_like(full_weight)
+            dist.broadcast(gradient, src=0)
+            weight.grad = distribute_tensor(gradient, weight.device_mesh, weight.placements)
+            updates = []
+            for block in gradient.split(block_sizes):
+                update = zeropower_via_newtonschulz5(block, epsilon=1e-7)
+                update.mul_(0.2 * math.sqrt(max(block.shape)))
+                updates.append(update)
+            expected[weight] = full_weight - lr * torch.cat(updates).float()
+
+        optimizer.step()
+        for weight, reference in expected.items():
+            torch.testing.assert_close(weight.full_tensor(), reference, atol=2e-4, rtol=1e-5)
 
 
 class TestNoPEDSAMultiLatentAttentionFloat8:
