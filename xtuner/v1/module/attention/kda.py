@@ -85,15 +85,14 @@ def _gate_param(param: torch.Tensor) -> torch.Tensor:
 # `fused_kda_gate` is itself `@torch.compiler.disable`d, and its conv dispatcher reaches Triton
 # launch helpers dynamo cannot trace.
 #
-# Only `fused_recurrent_kda` stays untraceable. It runs at `seq_len <=
-# _CHUNK_KERNEL_MIN_SEQ_LEN`, which compiled training never reaches, and the branch is chosen
-# from a Python int so only the taken branch is ever traced.
+# Only `fused_recurrent_kda` stays untraceable. It is inference-only and runs at
+# `seq_len <= _CHUNK_KERNEL_MIN_SEQ_LEN` in eval mode with gradients disabled.
 @torch._dynamo.disable
 def _run_recurrent_kda(**kwargs):
     return fused_recurrent_kda(**kwargs)
 
 
-# Sequences at or below this length use the recurrent kernel (matches Automodel's dispatch).
+# Eval-mode inference sequences at or below this length use the recurrent kernel.
 _CHUNK_KERNEL_MIN_SEQ_LEN = 64
 
 _fla_kda_import_error: BaseException | None = None
@@ -310,9 +309,9 @@ class KimiDeltaAttention(nn.Module):
         init_params(self.dt_bias, lambda t: t.uniform_(math.log(1e-3), math.log(1e-1)))
 
     def _select_kernel(self, seq_len: int, cp_context: Any | None):
-        # Automodel's dispatch: short (unpacked) sequences use the recurrent kernel; long
-        # sequences, or anything running under context parallel, use the chunked kernel.
-        if cp_context is not None or seq_len > _CHUNK_KERNEL_MIN_SEQ_LEN:
+        # Reentrant checkpointing disables gradients in the first training forward; use the
+        # same kernel during replay. Eval mode alone does not disable gradients either.
+        if self.training or torch.is_grad_enabled() or cp_context is not None or seq_len > _CHUNK_KERNEL_MIN_SEQ_LEN:
             return chunk_kda
         return _run_recurrent_kda
 

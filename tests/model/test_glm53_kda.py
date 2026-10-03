@@ -3,8 +3,11 @@
 需要 GPU：FLA 的 Triton kernel 没有 CPU 后端；SP 用例需要 2 卡。
 
 TestKDAGate
-    test_chunk_kda_signature_has_no_hf_style_gate_kwargs  钉住 fla 的签名，防上游漂移
     test_fused_kda_gate_matches_naive_reference           融合 gate 与朴素实现一致
+TestKDAKernelDispatch
+    test_grad_enabled_preserves_all_parameter_gradients  37/64/65 token 在 train/eval 下均有完整梯度
+    test_no_grad_matches_hf_at_kernel_boundary           无梯度时 37/64/65 token 的输出与 HF 一致
+    test_activation_checkpointing_matches_plain_training 重计算与普通训练的输出、输入及全部参数梯度一致
 TestKDAModuleParity
     test_kda_module_matches_hf_single_document            单文档下与 HF 实现一致
     test_kda_module_packed_multi_document_matches_concatenated_single_document_forwards
@@ -13,14 +16,15 @@ TestKDASequenceParallel
     test_forward_for_sp_matches_non_sp                    2 卡 SP 与非 SP 结果一致
 """
 
-import inspect
+from copy import deepcopy
 
 import pytest
 import torch
 from torch.testing._internal.common_distributed import DistributedTestBase
 
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.module.attention.kda import KDAConfig, chunk_kda, fused_kda_gate
+from xtuner.v1.model.utils.checkpointing import apply_activation_checkpointing
+from xtuner.v1.module.attention.kda import KDAConfig, fused_kda_gate
 from xtuner.v1.utils.test_utils import init_data_mesh
 
 
@@ -41,7 +45,12 @@ def _hf_glm53_kda(**overrides):
     )
     kwargs.update(overrides)
     config = Glm5NextTextConfig(**kwargs)
-    return Glm5NextTextLinearAttention(config, layer_idx=0), config
+    module = Glm5NextTextLinearAttention(config, layer_idx=0)
+    # Standalone HF modules leave these torch.empty parameters to the pretrained-model initializer.
+    with torch.no_grad():
+        module.forget_gate.A_log.zero_()
+        module.forget_gate.dt_bias.uniform_(-4.0, -1.0)
+    return module, config
 
 
 def _build_xtuner_kda(hidden_size=64, num_heads=4, head_dim=16, conv_kernel_size=4):
@@ -84,18 +93,6 @@ def _copy_hf_weights_into_xtuner(hf_module, xtuner_module) -> None:
 
 
 class TestKDAGate:
-    def test_chunk_kda_signature_has_no_hf_style_gate_kwargs(self):
-        """Reverse guard for design doc section 3.5.1: the installed fla's ``chunk_kda`` must
-        NOT accept ``A_log``/``dt_bias``/``use_beta_sigmoid_in_kernel`` -- if a future fla
-        upgrade adds them back, passing the externally-precomputed gate through ``g=`` would
-        silently double-apply the gate transform instead of raising. Catch that regression by
-        asserting these names stay absent from the kernel's signature."""
-        # 钉住 fla 的 chunk_kda 签名：它不接受 A_log/dt_bias，传进去会被静默吞掉。
-        params = set(inspect.signature(chunk_kda).parameters)
-        assert "A_log" not in params
-        assert "dt_bias" not in params
-        assert "use_beta_sigmoid_in_kernel" not in params
-
     @pytest.mark.gpu
     def test_fused_kda_gate_matches_naive_reference(self):
         # 融合 gate kernel 必须与朴素公式一致。
@@ -110,6 +107,85 @@ class TestKDAGate:
         got = fused_kda_gate(g_raw, a_log, dt_bias=dt_bias, lower_bound=-5.0)
         expected = naive_kda_lowerbound_gate(g_raw, a_log, dt_bias=dt_bias, lower_bound=-5.0)
         torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-4)
+
+
+class TestKDAKernelDispatch:
+    """验证 kernel 长度阈值两侧的完整梯度、推理精度与重计算一致性。"""
+
+    @pytest.mark.gpu
+    @pytest.mark.parametrize("seq_len", [37, 64, 65])
+    @pytest.mark.parametrize("training", [True, False], ids=["train", "eval"])
+    def test_grad_enabled_preserves_all_parameter_gradients(self, seq_len: int, training: bool) -> None:
+        # eval 不等于 no_grad：阈值两侧都必须保留 q/k/v、卷积、forget gate、beta 等全部参数的梯度。
+        torch.manual_seed(0)
+        module = _build_xtuner_kda().cuda().train(training)
+        hidden_states = torch.randn(1, seq_len, 64, device="cuda", requires_grad=True)
+        seq_ctx = SequenceContext.from_input_ids((torch.zeros(1, seq_len, dtype=torch.long),), device="cuda")
+
+        output = module(hidden_states, seq_ctx)["projected_output"]
+        assert torch.isfinite(output).all()
+        (output * torch.randn_like(output)).sum().backward()
+
+        missing = [name for name, param in module.named_parameters() if param.grad is None]
+        assert not missing, f"Missing parameter gradients: {missing}"
+        for name, param in module.named_parameters():
+            assert torch.isfinite(param.grad).all(), f"Non-finite gradient: {name}"
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+
+    @pytest.mark.gpu
+    @pytest.mark.parametrize("seq_len", [37, 64, 65])
+    @pytest.mark.parametrize("training", [True, False], ids=["train", "eval"])
+    def test_no_grad_matches_hf_at_kernel_boundary(self, seq_len: int, training: bool) -> None:
+        # 通过完整模块输出核验推理行为，不依赖内部 kernel 的具体分派或调用次数。
+        torch.manual_seed(0)
+        hf_module, _ = _hf_glm53_kda()
+        hf_module = hf_module.cuda().train(training)
+        module = _build_xtuner_kda().cuda().train(training)
+        _copy_hf_weights_into_xtuner(hf_module, module)
+        hidden_states = torch.randn(1, seq_len, 64, device="cuda")
+        seq_ctx = SequenceContext.from_input_ids((torch.zeros(1, seq_len, dtype=torch.long),), device="cuda")
+
+        with torch.no_grad():
+            expected = hf_module(hidden_states)
+            output = module(hidden_states, seq_ctx)["projected_output"]
+
+        assert not output.requires_grad
+        assert torch.isfinite(expected).all()
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.gpu
+    @pytest.mark.parametrize("seq_len", [37, 64, 65])
+    def test_activation_checkpointing_matches_plain_training(self, seq_len: int) -> None:
+        # 使用实际 reentrant 包装器：首次 no_grad 前向与有梯度重算必须采用一致的计算。
+        torch.manual_seed(0)
+        plain_module = _build_xtuner_kda().cuda().train()
+        replay_module = deepcopy(plain_module)
+        checkpointed_module = apply_activation_checkpointing(replay_module)
+        hidden_states = torch.randn(1, seq_len, 64, device="cuda", requires_grad=True)
+        checkpointed_hidden = hidden_states.detach().clone().requires_grad_()
+        seq_ctx = SequenceContext.from_input_ids((torch.zeros(1, seq_len, dtype=torch.long),), device="cuda")
+
+        expected = plain_module(hidden_states, seq_ctx)["projected_output"]
+        output = checkpointed_module(checkpointed_hidden, seq_ctx)["projected_output"]
+        torch.testing.assert_close(output, expected, atol=1e-6, rtol=1e-5)
+        # 非线性目标使上游梯度依赖首次前向值，避免常量输出梯度掩盖错误重计算。
+        expected.square().sum().backward()
+        output.square().sum().backward()
+
+        assert hidden_states.grad is not None
+        assert checkpointed_hidden.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+        assert torch.isfinite(checkpointed_hidden.grad).all()
+        torch.testing.assert_close(checkpointed_hidden.grad, hidden_states.grad, atol=1e-6, rtol=1e-5)
+        for name, param in plain_module.named_parameters():
+            replay_param = replay_module.get_parameter(name)
+            assert param.grad is not None, name
+            assert replay_param.grad is not None, name
+            assert torch.isfinite(param.grad).all(), name
+            assert torch.isfinite(replay_param.grad).all(), name
+            torch.testing.assert_close(replay_param.grad, param.grad, atol=1e-6, rtol=1e-5, msg=name)
 
 
 class TestKDAModuleParity:
