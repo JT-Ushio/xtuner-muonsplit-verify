@@ -1,6 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """flash_mla_cudnn SparseMLA 后端（FlashMLA 前向 + cuDNN 反向），见设计文档 F5.b。
 
+TestFlashMlaCudnnPackedGradients
+    test_natural_lse_preserves_query_and_kv_gradients      单文档/packed 的 dq、dkv 对照独立 FP32 参考
 TestFlashMlaCudnnSparseMLA
     test_forward_backward_matches_torch_reference         前反向与 torch 参考一致
     test_rejects_576_head_dim_without_matching_value_dim  维度白名单不接受错配的 value_dim
@@ -106,3 +108,39 @@ class TestFlashMlaCudnnSparseMLA:
         kv = torch.randn(4, 1, 512, device="cuda", dtype=torch.bfloat16)
         indices = torch.zeros(4, 1, 64, device="cuda", dtype=torch.int32)
         validate_sparse_mla_inputs(q, kv, indices, value_dim=512)  # must not raise
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _flash_mla_cudnn_available(), reason="requires FlashMLA + cuDNN DSA runtimes")
+class TestFlashMlaCudnnPackedGradients:
+    """独立 FP32 oracle 检验真实混合后端的 LSE 契约，避免只测 forward 漏掉错误 backward。"""
+
+    @pytest.mark.parametrize("document_lengths", [(64,), (17, 47)])
+    def test_natural_lse_preserves_query_and_kv_gradients(self, document_lengths: tuple[int, ...]) -> None:
+        # 相同 causal token 集合下，前向与 dq/dkv 均应匹配 FP32 数学参考，packed 文档互不串扰。
+        q, kv, indices = _nope_sparse_mla_inputs()
+        offset = 0
+        for length in document_lengths:
+            for row in range(offset, offset + length):
+                indices[row].fill_(-1)
+                indices[row, 0, : row - offset + 1] = torch.arange(offset, row + 1, device=q.device)
+            offset += length
+        assert offset == q.shape[0]
+        q_reference = q.float().requires_grad_()
+        kv_reference = kv.float().requires_grad_()
+        expected = sparse_mla(q_reference, kv_reference, indices, scaling=0.07, value_dim=512, backend="torch")
+        q.requires_grad_()
+        kv.requires_grad_()
+        actual = sparse_mla(q, kv, indices, scaling=0.07, value_dim=512, backend="flash_mla_cudnn")
+        grad_output = torch.randn_like(q)
+        expected.raw_output.backward(grad_output.float())
+        actual.raw_output.backward(grad_output)
+        for name, result, reference in (
+            ("output", actual.raw_output, expected.raw_output),
+            ("lse", actual.softmax_lse, expected.softmax_lse),
+            ("dq", q.grad, q_reference.grad),
+            ("dkv", kv.grad, kv_reference.grad),
+        ):
+            assert torch.isfinite(result).all(), name
+            relative_l2 = (result.float() - reference.float()).norm() / reference.float().norm().clamp_min(1e-12)
+            assert relative_l2 < 0.02, f"{name} relative L2 error: {relative_l2.item()}"
