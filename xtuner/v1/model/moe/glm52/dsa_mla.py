@@ -23,6 +23,7 @@ from xtuner.v1.ops.sparse_mla import (
     SparseMLAProtocol,
     ensure_cudnn_dsa_runtime_available,
     ensure_cute_dsl_runtime_available,
+    ensure_deep_select_runtime_available,
     ensure_flash_mla_runtime_available,
     ensure_tilelang_runtime_available,
     get_dsa_topk_indices,
@@ -70,7 +71,7 @@ def _validate_indexer_backend_config(
 def _validate_query_chunk_size(value: int | None, backend: str, *, field_name: str) -> None:
     if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
         raise ValueError(f"{field_name} must be a positive integer, got {value!r}")
-    if value is not None and backend not in ("tilelang", "cudnn_dsa", "flash_mla"):
+    if value is not None and backend not in ("tilelang", "cudnn_dsa", "flash_mla", "tilelang_deepselect"):
         raise ValueError("query-chunk Indexer selection requires a TileLang selector")
 
 
@@ -215,8 +216,14 @@ class DSAMLAConfig(MLAConfig):
             indexer_backend,
             field_name="indexer_topk_query_chunk_size",
         )
-        if indexer_backend == "tilelang" or self.sparse_mla_backend in ("tilelang", "cudnn_dsa", "flash_mla"):
+        if indexer_backend in ("tilelang", "tilelang_deepselect") or self.sparse_mla_backend in (
+            "tilelang",
+            "cudnn_dsa",
+            "flash_mla",
+        ):
             ensure_tilelang_runtime_available()
+        if indexer_backend == "tilelang_deepselect":
+            ensure_deep_select_runtime_available()
         if indexer_backend == "cute_dsl":
             ensure_cute_dsl_runtime_available()
         if self.sparse_mla_backend == "cudnn_dsa":
@@ -384,10 +391,8 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         # w_kc: [N, Dn, Rkv]; w_vc: [N, Dv, Rkv]
         w_kc, w_vc = torch.split(wkv_b, [self.qk_nope_head_dim, self.v_head_dim], dim=1)
 
-        # q_nope: [bsz, N, S, Rkv]
-        q_nope = torch.einsum("bhsd,hdm->bhsm", q_nope, w_kc)
-        # query_states: [S, N, Rkv + Dr]
-        query_states = torch.cat([q_nope, q_pe], dim=-1).squeeze(0).transpose(0, 1).contiguous()
+        # query_states: [S, N, Rkv + Dr] = [absorb(q_nope, w_kc), q_pe]
+        query_states = _absorbed_query(q_nope.squeeze(0).transpose(0, 1), q_pe.squeeze(0).transpose(0, 1), w_kc)
         # key_states: [bsz, S, Rkv + Dr] -> [S, 1, Rkv + Dr]
         key_states = torch.cat([kv_compressed, k_pe.transpose(1, 2).squeeze(2)], dim=-1)
         key_states = key_states.squeeze(0).unsqueeze(1).contiguous()
@@ -459,3 +464,52 @@ class DSAMultiLatentAttention(MultiLatentAttention):
     ) -> GLM52AttnOutputs: ...
 
     __call__ = nn.Module.__call__
+
+
+# The absorbed query is written by opaque custom ops: under torch.compile a strided ``bmm(out=...)`` would be
+# functionalized into a GEMM plus a copy, which is exactly the transpose this path avoids.
+@torch.library.custom_op("glm52::absorbed_query", mutates_args=())
+def _absorbed_query(q_nope: torch.Tensor, q_pe: torch.Tensor, w_kc: torch.Tensor) -> torch.Tensor:
+    # q_nope: [S, N, Dn] (a view of q_b_proj's output); q_pe: [S, N, Dr]; w_kc: [N, Dn, Rkv] -> [S, N, Rkv + Dr]
+    rank = w_kc.shape[-1]
+    query = q_nope.new_empty(q_nope.shape[0], q_nope.shape[1], rank + q_pe.shape[-1])
+    # cuBLAS reads each head of q_nope in place and writes it into the attention layout. The einsum + cat path wrote
+    # [N, S, Rkv] and then transposed the whole 4.8 GB query at 512K/SP8 (11.2 ms per call, ~1.6 ms this way).
+    torch.bmm(q_nope.transpose(0, 1), w_kc, out=query[..., :rank].transpose(0, 1))
+    query[..., rank:] = q_pe
+    return query
+
+
+@_absorbed_query.register_fake
+def _(q_nope: torch.Tensor, q_pe: torch.Tensor, w_kc: torch.Tensor) -> torch.Tensor:
+    return q_nope.new_empty(q_nope.shape[0], q_nope.shape[1], w_kc.shape[-1] + q_pe.shape[-1])
+
+
+@torch.library.custom_op("glm52::absorbed_query_backward", mutates_args=())
+def _absorbed_query_backward(
+    grad_query: torch.Tensor, q_nope: torch.Tensor, w_kc: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    grad_absorbed = grad_query[..., : w_kc.shape[-1]].transpose(0, 1)  # [N, S, Rkv]
+    grad_q_nope = q_nope.new_empty(q_nope.shape)
+    torch.bmm(grad_absorbed, w_kc.transpose(1, 2), out=grad_q_nope.transpose(0, 1))
+    grad_w_kc = torch.bmm(q_nope.transpose(0, 1).transpose(1, 2), grad_absorbed)
+    return grad_q_nope, grad_w_kc
+
+
+@_absorbed_query_backward.register_fake
+def _(grad_query: torch.Tensor, q_nope: torch.Tensor, w_kc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return q_nope.new_empty(q_nope.shape), w_kc.new_empty(w_kc.shape)
+
+
+def _setup_absorbed_query_context(ctx, inputs, output) -> None:
+    q_nope, _, w_kc = inputs
+    ctx.save_for_backward(q_nope, w_kc)
+
+
+def _absorbed_query_grad(ctx, grad_query: torch.Tensor):
+    q_nope, w_kc = ctx.saved_tensors
+    grad_q_nope, grad_w_kc = _absorbed_query_backward(grad_query, q_nope, w_kc)
+    return grad_q_nope, grad_query[..., w_kc.shape[-1] :], grad_w_kc
+
+
+_absorbed_query.register_autograd(_absorbed_query_grad, setup_context=_setup_absorbed_query_context)

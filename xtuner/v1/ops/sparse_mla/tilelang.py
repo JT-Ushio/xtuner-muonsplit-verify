@@ -3,6 +3,7 @@
 import functools
 import subprocess
 import sys
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -154,6 +155,7 @@ def tilelang_dsa_topk_indices(
     index_head_dim: int,
     index_topk: int,
     query_chunk_size: int | None = None,
+    selector: Literal["torch", "deep_select"] = "torch",
 ) -> torch.Tensor:
     """Select fixed-ID Top-K supports, optionally bounded by query chunks.
 
@@ -170,6 +172,8 @@ def tilelang_dsa_topk_indices(
         index_head_dim (int): Indexer head dimension used for score scaling.
         index_topk (int): Maximum number of source IDs to select per query.
         query_chunk_size (int | None): Maximum query rows per selector launch.
+        selector (Literal["torch", "deep_select"]): Top-K kernel applied to the TileLang logits;
+            ``"deep_select"`` replaces ``torch.topk`` with DeepSelect's radix-select kernel.
 
     Returns:
         torch.Tensor: Contiguous int32 IDs shaped ``(S, 1, min(index_topk, S_k))``.
@@ -242,11 +246,14 @@ def tilelang_indexer_topk_from_ranges(
         )
     block_q = 128 // q.shape[1]
     k_eff = min(index_topk, k.shape[0])
+    select_from_ranges = (
+        _tilelang_dsa_topk_indices_from_ranges if selector == "torch" else _deep_select_dsa_topk_indices_from_ranges
+    )
 
     # Keep the historical one-shot path when chunking is disabled.
     if query_chunk_size is None or query_chunk_size >= q.shape[0]:
         if q.shape[0] % block_q == 0:
-            return _tilelang_dsa_topk_indices_from_ranges(q, k, weights, starts, ends, index_topk)
+            return select_from_ranges(q, k, weights, starts, ends, index_topk)
         q, weights, starts, ends, valid_rows = _pad_tilelang_indexer_query_chunk(
             q,
             weights,
@@ -254,7 +261,7 @@ def tilelang_indexer_topk_from_ranges(
             ends,
             block_q=block_q,
         )
-        return _tilelang_dsa_topk_indices_from_ranges(
+        return select_from_ranges(
             q,
             k,
             weights,
@@ -275,7 +282,7 @@ def tilelang_indexer_topk_from_ranges(
             ends[lo:hi],
             block_q=block_q,
         )
-        chunk_ids = _tilelang_dsa_topk_indices_from_ranges(
+        chunk_ids = select_from_ranges(
             q_chunk,
             k,
             weights_chunk,
@@ -349,6 +356,47 @@ def _tilelang_dsa_topk_indices_from_ranges(
 
 
 @_tilelang_dsa_topk_indices_from_ranges.register_fake
+def _(
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    starts: Tensor,
+    ends: Tensor,
+    index_topk: int,
+) -> Tensor:
+    topk = min(index_topk, k.shape[0])
+    return torch.empty((q.shape[0], 1, topk), device=q.device, dtype=torch.int32)
+
+
+@torch.library.custom_op("sparse_mla::deep_select_dsa_topk_indices", mutates_args=(), device_types="cuda")
+def _deep_select_dsa_topk_indices_from_ranges(
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    starts: Tensor,
+    ends: Tensor,
+    index_topk: int,
+) -> Tensor:
+    import deep_select
+
+    from .tilelang_indexer_fwd import indexer_fwd_interface
+
+    # clean_logits keeps [0, start) at -inf so those keys never beat a valid key.
+    logits = indexer_fwd_interface(q, k, weights, starts, ends, clean_logits=True)
+    topk = min(index_topk, k.shape[0])
+    # ``end`` bounds each row's scan to its causal prefix instead of the full S_k.
+    _, topk_indices = deep_select.topk(logits, topk, end=ends, indices_type=torch.int32, return_value=False)
+    # DeepSelect returns unsorted IDs, so a row with at most ``topk`` valid keys
+    # can interleave -inf picks from [0, start) with valid ones.  Such a row
+    # selects its whole causal range anyway: write it as ``start + arange`` so
+    # invalid slots stay at the tail, as cuDNN DSA's ``topk_length`` expects.
+    full_range = starts[:, None] + torch.arange(topk, device=q.device, dtype=torch.int32)
+    full_range = full_range.masked_fill(full_range >= ends[:, None], -1)
+    topk_indices = torch.where((ends - starts <= topk)[:, None], full_range, topk_indices)
+    return topk_indices.unsqueeze(1)
+
+
+@_deep_select_dsa_topk_indices_from_ranges.register_fake
 def _(
     q: Tensor,
     k: Tensor,

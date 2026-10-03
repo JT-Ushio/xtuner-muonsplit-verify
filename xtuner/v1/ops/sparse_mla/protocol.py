@@ -8,10 +8,12 @@ from xtuner.v1.data_proto import SequenceContext
 
 SparseMLABackend = Literal["torch", "tilelang", "cudnn_dsa", "flash_mla", "flash_mla_cudnn"]
 # ``deep_gemm_fp8`` names the runtime dependency and its FP8 MQA score path.
-DSAIndexerBackend = Literal["torch", "tilelang", "cudnn_dsa", "flash_mla", "deep_gemm_fp8", "cute_dsl"]
-# GLM-5.3-Flash's KPool indexer (design doc F5.a) only has these two: "torch" is the eager
-# reference path, "tilelang" is the only production kernel today -- unlike GLM-5.2's per-token
-# DSAIndexerBackend, there's no cudnn_dsa/flash_mla/deep_gemm_fp8/cute_dsl KPool kernel.
+# ``tilelang_deepselect`` keeps TileLang scoring and replaces ``torch.topk`` with DeepSelect.
+DSAIndexerBackend = Literal[
+    "torch", "tilelang", "cudnn_dsa", "flash_mla", "deep_gemm_fp8", "cute_dsl", "tilelang_deepselect"
+]
+# GLM-5.3-Flash's KPool indexer only has these two implementations: DeepSelect and
+# the other per-token DSA indexers do not implement pooled top-k selection.
 KPoolIndexerBackend = Literal["torch", "tilelang"]
 
 
