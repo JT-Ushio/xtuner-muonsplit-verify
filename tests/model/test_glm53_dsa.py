@@ -318,8 +318,8 @@ class TestKpoolSelection:
                 assert local_selected == solo_selected, f"doc offset={offset} row={local_row}"
 
     @pytest.mark.gpu
-    @pytest.mark.parametrize("len1, query_chunk_size", [(97, None), (98, None), (97, 64)])
-    def test_tilelang_matches_torch_reference(self, len1, query_chunk_size):
+    @pytest.mark.parametrize("len1, query_chunk_size", [(97, None), (98, None), (97, 64), (98, 64)])
+    def test_tilelang_matches_torch_reference(self, len1: int, query_chunk_size: int | None) -> None:
         # 生产 kernel 与 torch 参考实现选出的 token 集合必须一致；len1=98 让总 query 数
         # 不能被 block_q(=128/32) 整除，覆盖尾块填充，query_chunk_size 覆盖分块路径。
         torch.manual_seed(5)
