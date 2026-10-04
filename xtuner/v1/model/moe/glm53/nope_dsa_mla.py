@@ -350,7 +350,9 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
         """
         kv_compressed = self.kv_a_layernorm(self.kv_a_proj_with_mqa(hidden_states))  # [1, S, Rkv]
         key_states = kv_compressed.squeeze(0).unsqueeze(1).contiguous()
-        return gather_for_sequence_parallel(key_states, dim=0, sp_mesh=seq_ctx.sequence_parallel_mesh)
+        return gather_for_sequence_parallel(
+            key_states, dim=0, sp_mesh=seq_ctx.sequence_parallel_mesh, reduce_dtype=torch.float32
+        )
 
     @overload  # type: ignore
     def __call__(  # type: ignore
