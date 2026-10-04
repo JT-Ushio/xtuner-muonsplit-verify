@@ -32,6 +32,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEMLP
 from xtuner.v1.ops.sparse_mla.kpool import (
     build_pool_index,
     build_pools,
+    expand_pools_and_tail,
     kpool_output_width,
     kpool_topk_indices,
     torch_kpool_topk_indices,
@@ -367,6 +368,26 @@ class TestKpoolSelection:
             torch_set = set(torch_out[row, 0].tolist()) - {-1}
             tilelang_set = set(tilelang_out[row, 0].tolist()) - {-1}
             assert torch_set == tilelang_set, f"row {row}: torch={torch_set} tilelang={tilelang_set}"
+
+
+class TestKpoolCanonicalExpansion:
+    def test_pool_permutations_preserve_causal_tokens_and_output_order(self):
+        # 完整池的候选顺序不能改变 attention 累加顺序；尾池和 -1 padding 也必须保留。
+        seq_ctx = _seq_ctx([16])
+        pools = build_pool_index(seq_ctx, 16, 4, "cpu")
+        selected = torch.full((16, 1, 4), -1, dtype=torch.int32)
+        for token in range(16):
+            complete = (token + 1) // 4
+            selected[token, 0, :complete] = torch.arange(complete)
+        permuted = selected[:, :, [2, 0, 3, 1]]
+        kwargs = dict(index_topk=16, index_kpool=4, always_select_tail=True, alignment=16)
+        reference = expand_pools_and_tail(selected, pools, seq_ctx, **kwargs)
+        actual = expand_pools_and_tail(permuted, pools, seq_ctx, **kwargs)
+        assert torch.equal(actual, reference)
+        assert actual.shape == (16, 1, 32)
+        for token, row in enumerate(actual[:, 0]):
+            assert row[row >= 0].tolist() == list(range(token + 1))
+            assert (row[19:] == -1).all()
 
 
 class TestKpoolSequenceParallel:

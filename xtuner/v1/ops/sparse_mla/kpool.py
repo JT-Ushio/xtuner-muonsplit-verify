@@ -270,7 +270,9 @@ def expand_pools_and_tail(
     width = kpool_output_width(index_topk, index_kpool, alignment)
     out = selected_pool_ids.new_full((seq_len, width), -1, dtype=torch.int32)
 
-    selected = selected_pool_ids.squeeze(1).to(torch.int64)  # [S, index_topk // index_kpool]
+    # Top-k order is not semantic, but changes the sparse attention reduction order.
+    # Canonicalize pools before expansion so identical selections agree across SP sizes.
+    selected = selected_pool_ids.squeeze(1).sort(dim=-1).values.to(torch.int64)
     valid_sel = selected >= 0
     safe_sel = selected.clamp(min=0)
     expanded = pool_index[safe_sel].masked_fill(~valid_sel.unsqueeze(-1), -1)  # [S, select_k, kpool]
