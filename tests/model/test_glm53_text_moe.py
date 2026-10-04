@@ -203,7 +203,7 @@ class TestGlm53TextMoEFp32Params:
 
     def test_only_the_sinkhorn_and_gate_scalars_are_pinned_to_fp32(self):
         # sinkhorn 的 base/scale 与 KDA 的 A_log/dt_bias 必须留在 fp32；而 hc_*_fn 刻意不留
-        # （hc_pre 本就把它转成激活 dtype，pin 住只会让 45x2 个投影矩阵在每个 rank 上复制）。
+        # （hc_pre 在算子内转成 fp32；pin 住会额外让投影矩阵在每个 rank 上复制）。
         cfg = _tiny_cfg()
         model = cfg.build()
         pinned = [n for n, _ in model.named_parameters() if re.search(r"hc_(attn|ffn)_(base|scale)|A_log|dt_bias", n)]
@@ -397,4 +397,3 @@ class TestNoPEDSAMLAConfigValidatesAssignment:
             cfg.sparse_mla_backend = "tilelang"
         cfg.sparse_mla_backend = "torch"
         assert cfg.sparse_mla_backend == "torch"
-

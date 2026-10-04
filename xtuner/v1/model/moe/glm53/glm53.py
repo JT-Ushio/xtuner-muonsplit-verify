@@ -343,9 +343,8 @@ class Glm53TextMoEConfig(MoEConfig):
     # (and `_get_save_dtype` then writes them back out as fp32). Needed because
     # `hc_split_sinkhorn`'s 20 iterations and KDA's `fused_kda_gate` are bf16-unstable.
     #
-    # `hc_*_fn` is deliberately absent: `hc_pre` already casts it to the activation dtype, and
-    # ignored parameters are replicated rather than sharded, so pinning a
-    # [mix, hc_mult * hidden_size] matrix on 45 x 2 sites would cost real memory for nothing.
+    # hc_*_fn keeps the normal FSDP parameter policy. hc_pre casts its gathered value
+    # to fp32 for the projection; that does not require making the matrices replicated.
     #
     # Gradients of ignored (replicated) parameters are all-reduced by
     # `MoE.scale_and_reduce_grad`, which `TrainEngine.clip_grad_norm` calls before the grad
