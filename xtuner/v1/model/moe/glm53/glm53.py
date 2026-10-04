@@ -356,6 +356,7 @@ class Glm53TextMoEConfig(MoEConfig):
             r"model\.language_model\.layers\.\d+\.hc_(attn|ffn)_(base|scale)",
             r"model\.language_model\.layers\.\d+\.self_attn\.A_log",
             r"model\.language_model\.layers\.\d+\.self_attn\.dt_bias",
+            r"model\.language_model\.layers\.\d+\.self_attn\.[qkv]_conv1d\.(weight|bias)",
         ],
     )
 
