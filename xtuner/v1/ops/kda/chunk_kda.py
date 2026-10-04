@@ -10,7 +10,7 @@ it. Calling it from a compiled region therefore forces a graph break at every KD
 GLM-5.3-Flash is KDA-dominated (34 of 45 layers), which measured ~2.4x slower per step than eager.
 
 This module takes the route ``xtuner/v1/ops/gated_deltanet`` already took for GatedDeltaNet: call
-FLA's ``chunk_kda_fwd``/``chunk_kda_bwd`` behind ``torch.library.custom_op``. Dynamo treats a
+FLA's forward stages/``chunk_kda_bwd`` behind ``torch.library.custom_op``. Dynamo treats a
 custom op as an opaque node and traces straight through it, so the chunk-table preparation (and
 its host sync) stays outside the graph without breaking it.
 
@@ -21,10 +21,15 @@ set) and no FLA context parallelism. Anything else should keep using FLA's own e
 
 import torch
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
+from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
 from fla.ops.kda.chunk_bwd import chunk_kda_bwd as _fla_chunk_kda_bwd
-from fla.ops.kda.chunk_fwd import chunk_kda_fwd as _fla_chunk_kda_fwd
+from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra
+from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+
+from .chunk_cumsum import chunk_cumsum
 
 
 LIBRARY_NAME = "xtuner_kda"
@@ -65,24 +70,49 @@ def chunk_kda_fwd(
     # `ChunkKDAFunction`, which does it outside the kernel and keeps `rstd` for the backward.
     q_l2, q_rstd = l2norm_fwd(q)
     k_l2, k_rstd = l2norm_fwd(k)
-    o, _, g_cumsum, Aqk, Akk = _fla_chunk_kda_fwd(
+    chunk_indices = _chunk_indices(cu_seqlens)
+    g_cumsum = chunk_cumsum(g, cu_seqlens, chunk_indices, RCP_LN2)
+    # Reuse FLA's forward stages with the fixed-layout prefix. The public FLA
+    # forward computes its own autotuned prefix and cannot accept one externally.
+    w, u, _, kg, Aqk, Akk = chunk_kda_fwd_intra(
         q=q_l2,
         k=k_l2,
         v=v,
-        g=g,
+        gk=g_cumsum,
         beta=beta,
         scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=_CHUNK_SIZE,
+        safe_gate=safe_gate,
+    )
+    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+        k=kg,
+        w=w,
+        u=u,
+        gk=g_cumsum,
         initial_state=None,
         output_final_state=False,
         cu_seqlens=cu_seqlens,
-        chunk_indices=_chunk_indices(cu_seqlens),
-        chunk_size=_CHUNK_SIZE,
-        safe_gate=safe_gate,
-        lower_bound=lower_bound,
+        chunk_indices=chunk_indices,
+        use_exp2=True,
         transpose_state_layout=transpose_state_layout,
-    )[:5]
-    # `disable_recompute=False` (the default) frees w/u/qg/kg/v_new/h inside the forward and the
-    # backward recomputes them, so only these five tensors have to cross the op boundary.
+    )
+    o = chunk_gla_fwd_o_gk(
+        q=q_l2,
+        v=v_new,
+        g=g_cumsum,
+        A=Aqk,
+        h=h,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=_CHUNK_SIZE,
+        use_exp2=True,
+        transpose_state_layout=transpose_state_layout,
+    )
+    # Backward recomputes w/u/qg/kg/v_new/h from this exact prefix; only these
+    # five tensors have to cross the op boundary.
     return o, g_cumsum, Aqk, Akk, q_l2, q_rstd, k_l2, k_rstd
 
 
@@ -105,7 +135,7 @@ def _chunk_kda_fwd_fake(
     rstd_shape = (batch, seq_len, num_heads)
     return (
         torch.empty_like(v),
-        torch.empty_like(g),
+        torch.empty_like(g, dtype=torch.float32),
         q.new_empty((batch, seq_len, num_heads, _CHUNK_SIZE)),
         q.new_empty((batch, seq_len, num_heads, _CHUNK_SIZE)),
         torch.empty_like(q),
@@ -257,9 +287,8 @@ def chunk_kda(
 ) -> tuple[torch.Tensor, None]:
     """Chunked Kimi Delta Attention, traceable by ``torch.compile``.
 
-    Numerically identical to ``fla.ops.kda.chunk_kda`` for the supported call shape: it runs the
-    same ``chunk_kda_fwd``/``chunk_kda_bwd`` kernels with the same arguments, only behind custom
-    ops so a compiled caller does not graph-break.
+    Uses FLA's forward/backward stages behind custom ops, with a fixed-layout FP32 gate prefix
+    so changing the Ulysses head count does not change the scan's addition order.
 
     Args:
         q (torch.Tensor): Queries of shape ``[B, T, H, K]``.

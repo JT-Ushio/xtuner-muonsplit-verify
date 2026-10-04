@@ -74,8 +74,8 @@ def _gate_param(param: torch.Tensor) -> torch.Tensor:
 
 
 # The chunked kernel runs through `xtuner.v1.ops.kda`, which wraps FLA's
-# `chunk_kda_fwd`/`chunk_kda_bwd` in `torch.library.custom_op` (bitwise-identical to
-# `fla.ops.kda.chunk_kda`, verified in tests/model/test_glm53_kda.py). Dynamo traces through a
+# forward stages/`chunk_kda_bwd` in `torch.library.custom_op`, with a fixed-layout gate
+# prefix for SP stability. Dynamo traces through a
 # custom op, so the chunk-table preparation -- `prepare_chunk_indices`, whose `.tolist()` on
 # `cu_seqlens` inductor cannot lower -- stays hidden without breaking the graph. This is the same
 # route `xtuner/v1/ops/gated_deltanet` takes for GatedDeltaNet, and it matters here because
