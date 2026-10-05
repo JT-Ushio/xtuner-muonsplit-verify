@@ -14,7 +14,7 @@ unlike GLM-5.2's ``dsa_topk_source_layer``/``GLM52MTPBlock`` machinery.
 from typing import Literal, cast
 
 import torch
-from pydantic import ConfigDict, model_validator
+from pydantic import ConfigDict, Field, model_validator
 from torch import nn
 from torch.nn import functional as F
 from typing_extensions import overload
@@ -28,6 +28,7 @@ from xtuner.v1.module.linear import build_linear
 from xtuner.v1.module.rms_norm import LayerNorm
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.comm import gather_for_sequence_parallel
+from xtuner.v1.ops.fp32_linear import fp32_linear
 from xtuner.v1.ops.sparse_mla import (
     KPoolIndexerBackend,
     SparseMLABackend,
@@ -69,6 +70,8 @@ class KPoolIndexer(nn.Module):
         indexer_backend: KPoolIndexerBackend,
         alignment: int,
         topk_query_chunk_size: int | None = None,
+        compute_dtype: Literal["native", "float32"] = "native",
+        projection_block_size: int = 0,
     ):
         super().__init__()
         self.index_head_dim = index_head_dim
@@ -79,6 +82,8 @@ class KPoolIndexer(nn.Module):
         self.indexer_backend = indexer_backend
         self.alignment = alignment
         self.topk_query_chunk_size = topk_query_chunk_size
+        self.compute_dtype = compute_dtype
+        self.projection_block_size = projection_block_size
         # Resolved once here (not per forward call), mirroring GLM-5.2's
         # get_dsa_topk_indices(indexer_backend) precomputation.
         self._topk_indices_fn = get_kpool_topk_indices(indexer_backend)
@@ -106,10 +111,29 @@ class KPoolIndexer(nn.Module):
         gate_weight = materialize_full(self.index_kpool_compress_gate, name="indexer.index_kpool_compress_gate")
         kpool_ape = materialize_full(self.index_kpool_compress_ape, name="indexer.index_kpool_compress_ape")
 
-        q = self.wq_b(q_resid).view(bsz, seq_len, self.index_n_heads, self.index_head_dim)
-        k = self.k_norm(self.wk(hidden_states))
-        gate_scores = F.linear(hidden_states, gate_weight)
-        weights = self.weights_proj(hidden_states).float()
+        if self.compute_dtype == "float32":
+
+            def project(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+                weight = materialize_full(layer.weight, name="indexer.projection.weight")
+                return fp32_linear(x, weight, block_size=self.projection_block_size)
+
+            q = project(self.wq_b, q_resid)
+            k = project(self.wk, hidden_states)
+            norm_weight = materialize_full(self.k_norm.weight, name="indexer.k_norm.weight").float()
+            norm_bias = materialize_full(self.k_norm.bias, name="indexer.k_norm.bias").float()
+            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                k = F.layer_norm(k, self.k_norm.normalized_shape, norm_weight, norm_bias, self.k_norm.eps)
+            gate_scores = fp32_linear(hidden_states, gate_weight, block_size=self.projection_block_size)
+            weights = project(self.weights_proj, hidden_states)
+            # TileLang's score GEMM consumes BF16 Q/K; keep scoring weights in FP32.
+            q = q.to(hidden_states.dtype)
+            k = k.to(hidden_states.dtype)
+        else:
+            q = self.wq_b(q_resid)
+            k = self.k_norm(self.wk(hidden_states))
+            gate_scores = F.linear(hidden_states, gate_weight)
+            weights = self.weights_proj(hidden_states).float()
+        q = q.view(bsz, seq_len, self.index_n_heads, self.index_head_dim)
 
         topk_ids = self._topk_indices_fn(
             q,
@@ -160,6 +184,8 @@ class NoPEDSAMLAConfig(MLAConfig):
     # the per-token DSA indexer's.
     indexer_topk_query_chunk_size: int | None = None
     freeze_dsa_indexer: bool = True
+    indexer_compute_dtype: Literal["native", "float32"] = "native"
+    indexer_projection_block_size: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _check(self) -> "NoPEDSAMLAConfig":
@@ -221,6 +247,8 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
         indexer_backend: KPoolIndexerBackend,
         indexer_topk_query_chunk_size: int | None,
         freeze_dsa_indexer: bool,
+        indexer_compute_dtype: Literal["native", "float32"] = "native",
+        indexer_projection_block_size: int = 0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -266,6 +294,8 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
             indexer_backend=indexer_backend,
             alignment=self.alignment,
             topk_query_chunk_size=indexer_topk_query_chunk_size,
+            compute_dtype=indexer_compute_dtype,
+            projection_block_size=indexer_projection_block_size,
         )
         if freeze_dsa_indexer:
             self.indexer.requires_grad_(False)
