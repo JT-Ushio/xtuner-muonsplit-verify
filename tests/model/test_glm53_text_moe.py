@@ -14,7 +14,7 @@ TestGlm53TextMoEFp32Params
     test_only_the_sinkhorn_and_gate_scalars_are_pinned_to_fp32  该 pin 的 pin，fn 刻意不 pin
 TestGlm53TextMoEForwardBackward
     test_forward_backward_all_trainable_params_get_gradient  除冻结 indexer 外都有梯度
-    test_mtp_block_builds_and_forwards                       MTP block 可构造并前向
+    test_mtp_block_builds_and_forwards                       MTP CE 前向和反向覆盖所有可训练参数
 TestGlm53TextMoEWeightMapping
     test_real_checkpoint_weight_coverage                     真实 checkpoint 权重全覆盖
 TestGlm53TextMoEAccuracy
@@ -245,8 +245,10 @@ class TestGlm53TextMoEForwardBackward:
                 assert p.grad is not None and p.grad.abs().sum() > 0, f"{name} got no gradient"
 
     def test_mtp_block_builds_and_forwards(self):
-        # MTP block 能构造并参与前向。
+        # MTP 必须实际执行 CE 前向和反向，而不只在无 loss context 时构造。
         cfg = _tiny_cfg(mtp_config=MTPConfig(num_layers=1, share_weights=True))
+        cfg.attention.freeze_dsa_indexer = True
+        cfg.lm_loss_cfg = CELossConfig(mode="chunk", chunk_size=64)
         model = cfg.build().cuda().to(torch.bfloat16)
         for p in model.parameters():
             if p.is_floating_point():
@@ -258,8 +260,18 @@ class TestGlm53TextMoEForwardBackward:
         seq_len = 128
         input_ids = torch.randint(2, 200, (1, seq_len)).cuda()
         seq_ctx = SequenceContext.from_input_ids((input_ids,), device="cuda")
-        out = model(seq_ctx=seq_ctx, loss_ctx=None)
-        assert torch.isfinite(out.logits).all()
+        labels = input_ids.clone()
+        labels[:, :16] = -100
+        labels[:, -1] = -100
+        loss_ctx = model.build_loss_ctx_batch([{"seq_ctx": seq_ctx, "shifted_labels": labels}])[0]
+        out = model(seq_ctx=seq_ctx, loss_ctx=loss_ctx)
+        assert out.mtp_loss is not None and torch.isfinite(out.mtp_loss) and out.mtp_loss > 0
+        (out.loss + out.mtp_loss + out.balancing_loss).backward()
+        for name, parameter in model.mtp_block.named_parameters():
+            if parameter.requires_grad:
+                assert parameter.grad is not None, name
+                assert torch.isfinite(parameter.grad).all(), name
+                assert parameter.grad.abs().sum() > 0, name
 
 
 class TestGlm53TextMoEWeightMapping:
