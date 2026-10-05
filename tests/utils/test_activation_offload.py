@@ -3,8 +3,9 @@
 from unittest import mock
 
 import pytest
+import torch
 
-from xtuner.v1.utils.activation_offload import OffloadItem, OffloadManager, SingletonMeta
+from xtuner.v1.utils.activation_offload import OffloadItem, OffloadManager, SingletonMeta, SwapTensor
 
 
 @pytest.fixture
@@ -33,3 +34,29 @@ class TestOffloadManager:
     def test_clear_step_is_noop_without_offload(self, manager):
         manager.clear_step()  # no entries; must not raise
         assert not manager.items
+
+
+class TestSwapTensor:
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA GPU")
+    @pytest.mark.parametrize("sliced", [False, True])
+    def test_d2h_preserves_values_when_allocation_stream_reuses_storage(self, sliced: bool) -> None:
+        allocation_stream = torch.cuda.Stream()
+        copy_stream = torch.cuda.Stream()
+        elements = 4 * 1024 * 1024
+        with torch.cuda.stream(allocation_stream):
+            source = torch.ones(elements, device="cuda", dtype=torch.float32)
+            ready = torch.cuda.Event()
+            ready.record()
+        torch.cuda.current_stream().wait_event(ready)
+        swap = SwapTensor(source[: elements // 2] if sliced else source, "d2h_lifetime")
+        with torch.cuda.stream(copy_stream):
+            # Keep D2H pending while the source allocation stream requests another block.
+            torch.cuda._sleep(100_000_000)
+        swap.launch_d2h(copy_stream)
+        swap.wait_d2h_finished(copy_stream, flag=True)
+        with torch.cuda.stream(allocation_stream):
+            replacement = torch.empty(elements, device="cuda", dtype=torch.float32)
+            replacement.fill_(2)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(swap.tensor_cpu, torch.ones_like(swap.tensor_cpu), rtol=0, atol=0)

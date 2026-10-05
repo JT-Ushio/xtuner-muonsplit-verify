@@ -85,6 +85,8 @@ class SwapTensor:
         if self.stat != "device":
             return
 
+        # Storage may be released before this stream finishes the asynchronous copy.
+        self.tensor.record_stream(stream)
         forward_event = torch.cuda.Event()
         forward_event.record()
         with torch.no_grad():
@@ -219,8 +221,8 @@ class OffloadManager(metaclass=SingletonMeta):
         if not (self.items or self.may_npu_tensors):
             return
         # Offload copies run on streams this manager does not own. Drain the device before
-        # dropping references: launch_d2h reads tensor on the d2h stream without record_stream,
-        # and prefetch_launch_h2d reads the pinned CPU buffer, which record_stream cannot cover.
+        # dropping pinned CPU buffers read by prefetch_launch_h2d; record_stream only
+        # protects CUDA storage and cannot cover these host buffers.
         torch.cuda.synchronize()
         self.clear(group=group)
 
