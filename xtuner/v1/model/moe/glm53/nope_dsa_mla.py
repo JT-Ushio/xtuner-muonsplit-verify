@@ -114,7 +114,7 @@ class KPoolIndexer(nn.Module):
         if self.compute_dtype == "float32":
 
             def project(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
-                weight = materialize_full(layer.weight, name="indexer.projection.weight")
+                weight = materialize_full(cast(torch.Tensor, layer.weight), name="indexer.projection.weight")
                 return fp32_linear(x, weight, block_size=self.projection_block_size)
 
             q = project(self.wq_b, q_resid)

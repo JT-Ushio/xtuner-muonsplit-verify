@@ -1,6 +1,7 @@
+from typing import Protocol
+
 import torch
 import torch.distributed as dist
-from torch.autograd.function import FunctionCtx
 from torch.distributed._functional_collectives import (
     all_gather_tensor,
     all_gather_tensor_autograd,
@@ -64,10 +65,17 @@ def split_for_sequence_parallel(input, dim: int, sp_mesh):
     return output
 
 
+class _GatherContext(Protocol):
+    dim: int
+    sp_mesh: DeviceMesh
+    reduce_dtype: torch.dtype
+    input_dtype: torch.dtype
+
+
 class _GatherWithReduceDtype(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx: FunctionCtx,
+        ctx: _GatherContext,
         input: torch.Tensor,
         dim: int,
         sp_mesh: DeviceMesh,
@@ -80,7 +88,7 @@ class _GatherWithReduceDtype(torch.autograd.Function):
         return wait_tensor(all_gather_tensor(input.contiguous(), gather_dim=dim, group=sp_mesh))
 
     @staticmethod
-    def backward(ctx: FunctionCtx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+    def backward(ctx: _GatherContext, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
         # Sum each rank's contribution before rounding back to the activation dtype.
         grad_input = reduce_scatter_tensor(
             grad_output.to(ctx.reduce_dtype).contiguous(), "sum", scatter_dim=ctx.dim, group=ctx.sp_mesh
